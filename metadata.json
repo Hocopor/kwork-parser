@@ -1,0 +1,6 @@
+{
+  "name": "Kwork Parser & VK Bot",
+  "description": "A full-stack Kwork,ru web scraper and VK bot that monitors freelance projects in selected categories and instantly notifies subscribers via VK group API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

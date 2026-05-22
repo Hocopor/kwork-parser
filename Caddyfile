@@ -1,0 +1,19 @@
+# Caddyfile для Kwork Parser & VK Bot
+# Домен: kworkpas.mak-o.ru
+# Используется с включенным проксированием Cloudflare (Orange Cloud)
+
+kworkpas.mak-o.ru {
+    # Настройка резолвинга реального IP клиента от прокси Cloudflare
+    reverse_proxy localhost:3000 {
+        header_up X-Real-IP {header.CF-Connecting-IP}
+        header_up X-Forwarded-For {header.CF-Connecting-IP}
+    }
+
+    # Логирование запросов в файл (Caddy создаст директорию автоматически)
+    log {
+        output file /var/log/caddy/kwork_parser_access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}
