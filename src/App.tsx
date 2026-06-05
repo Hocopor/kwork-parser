@@ -20,11 +20,134 @@ import {
   FileText,
   UserCheck,
   ChevronRight,
-  Info
+  Info,
+  Lock,
+  LogOut
 } from 'lucide-react';
 import { KworkProject, KworkCategory, LogEntry, ParserStatus } from './types';
 
+// Экран входа по паролю (показывается, если на сервере задан DASHBOARD_PASSWORD_HASH)
+function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      if (res.ok) {
+        onSuccess();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error || 'Неверный пароль');
+      }
+    } catch {
+      setError('Ошибка связи с сервером');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-900 px-4">
+      <form
+        onSubmit={submit}
+        className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-8 w-full max-w-sm flex flex-col gap-5"
+      >
+        <div className="flex flex-col items-center gap-2 text-center">
+          <div className="w-12 h-12 rounded-2xl bg-indigo-500/20 flex items-center justify-center">
+            <Lock className="w-6 h-6 text-indigo-400" />
+          </div>
+          <h1 className="text-xl font-bold text-white">Kwork Parser</h1>
+          <p className="text-xs text-slate-400">Панель защищена паролем. Введите пароль для доступа.</p>
+        </div>
+
+        <div>
+          <input
+            type="password"
+            autoFocus
+            className="w-full text-sm bg-slate-900 border border-slate-600 rounded-xl px-4 py-2.5 text-white outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all placeholder:text-slate-500"
+            placeholder="Пароль"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+          />
+          {error && (
+            <p className="text-rose-400 text-xs mt-2 flex items-center gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5" /> {error}
+            </p>
+          )}
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-2"
+        >
+          {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
+          <span>Войти</span>
+        </button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  // Auth gate state
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+
+  const checkAuth = async () => {
+    try {
+      const res = await fetch('/api/auth/check');
+      if (res.ok) {
+        const data = await res.json();
+        setAuthRequired(data.authRequired);
+        setAuthenticated(data.authenticated);
+      }
+    } catch {
+      // если проверка не удалась — показываем приложение, API сам вернёт 401
+      setAuthenticated(true);
+    } finally {
+      setAuthChecked(true);
+    }
+  };
+
+  const logout = async () => {
+    try {
+      await fetch('/api/logout', { method: 'POST' });
+    } catch { /* ignore */ }
+    setAuthenticated(false);
+  };
+
+  useEffect(() => {
+    checkAuth();
+  }, []);
+
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-900 text-slate-400">
+        <RefreshCw className="w-6 h-6 animate-spin" />
+      </div>
+    );
+  }
+
+  if (authRequired && !authenticated) {
+    return <LoginScreen onSuccess={() => setAuthenticated(true)} />;
+  }
+
+  return <Dashboard authRequired={authRequired} onLogout={logout} />;
+}
+
+function Dashboard({ authRequired, onLogout }: { authRequired: boolean; onLogout: () => void }) {
   // Parser and Settings state
   const [status, setStatus] = useState<ParserStatus>({
     isParsingActive: false,
@@ -409,6 +532,16 @@ export default function App() {
                 </>
               )}
             </button>
+            {authRequired && (
+              <button
+                onClick={onLogout}
+                title="Выйти из панели"
+                className="px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer bg-slate-700 hover:bg-slate-600 text-slate-200"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Выход</span>
+              </button>
+            )}
           </div>
         </header>
 

@@ -2,9 +2,9 @@
 # Домен: kworkpas.mak-o.ru
 # Используется с включенным проксированием Cloudflare (Orange Cloud)
 
-kworkpas.mak-o.ru {
-    # Настройка резолвинга реального IP клиента от прокси Cloudflare
-    reverse_proxy localhost:3000 {
+http://kworkpas.mak-o.ru {
+    # HTTPS терминируется на стороне Cloudflare, здесь только HTTP
+    reverse_proxy localhost:3001 {
         header_up X-Real-IP {header.CF-Connecting-IP}
         header_up X-Forwarded-For {header.CF-Connecting-IP}
     }

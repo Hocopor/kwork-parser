@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
@@ -228,144 +229,236 @@ function getVkKeyboard() {
   };
 }
 
-// Kwork HTML parser helper
-async function parseKworkPage(url: string): Promise<KworkProject[]> {
-  const userAgents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1'
-  ];
-  const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+// ----------------------------------------------------------------------------
+// KWORK HTTP SESSION (стабильный отпечаток браузера + хранилище cookie)
+// ----------------------------------------------------------------------------
+// Ротация User-Agent на каждый запрос — это само по себе признак бота (один и
+// тот же cookie-сеанс с разными UA выглядит подозрительно). Поэтому фиксируем
+// ОДИН реалистичный отпечаток Chrome на весь процесс и сохраняем cookie между
+// запросами — так трафик неотличим от обычного вернувшегося пользователя.
+const SESSION_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const cookieJar = new Map<string, string>();
+let sessionWarmed = false;
 
-  // Set randomized headers to completely prevent user block or captchas
-  const headers = {
-    'User-Agent': userAgent,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+function buildCookieHeader(): string {
+  return [...cookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function storeCookies(res: Response) {
+  // Node 18+ предоставляет getSetCookie(); подстраховываемся одиночным заголовком.
+  let rawCookies: string[] = [];
+  const anyHeaders = res.headers as any;
+  if (typeof anyHeaders.getSetCookie === 'function') {
+    rawCookies = anyHeaders.getSetCookie();
+  } else {
+    const single = res.headers.get('set-cookie');
+    if (single) rawCookies = [single];
+  }
+  for (const c of rawCookies) {
+    const pair = c.split(';')[0];
+    const eq = pair.indexOf('=');
+    if (eq > 0) {
+      cookieJar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+  }
+}
+
+// Единая точка HTTP-запросов к Kwork с человекоподобными заголовками.
+async function kworkFetch(url: string, referer = 'https://kwork.ru/projects'): Promise<Response> {
+  const headers: Record<string, string> = {
+    'User-Agent': SESSION_UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
-    'Referer': 'https://kwork.ru/',
+    'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'same-origin',
     'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1'
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': referer
   };
+  const cookie = buildCookieHeader();
+  if (cookie) headers['Cookie'] = cookie;
 
-  const response = await fetch(url, { headers });
-  if (!response.ok) {
-    throw new Error(`Kwork ответил с ошибкой: ${response.status}`);
+  const response = await fetch(url, { headers, redirect: 'follow' });
+  storeCookies(response);
+  return response;
+}
+
+// «Прогрев» сессии: один заход на главную, чтобы получить cookie как настоящий
+// браузер, прежде чем дёргать страницы категорий.
+async function warmUpSession() {
+  if (sessionWarmed) return;
+  try {
+    const res = await kworkFetch('https://kwork.ru/', 'https://www.google.com/');
+    if (res.ok) {
+      sessionWarmed = true;
+      await new Promise(r => setTimeout(r, 800 + Math.random() * 1200));
+    }
+  } catch {
+    // тихо игнорируем — основной запрос всё равно попробует
   }
-  
-  const html = await response.text();
+}
+
+// Извлекаем JSON из `window.stateData = {...}` балансировкой скобок.
+function extractStateData(html: string): any | null {
+  const marker = 'window.stateData=';
+  const markerIdx = html.indexOf(marker);
+  if (markerIdx === -1) return null;
+
+  let i = markerIdx + marker.length;
+  while (i < html.length && html[i] !== '{') i++;
+  const objStart = i;
+
+  let depth = 0, inStr = false, esc = false;
+  for (; i < html.length; i++) {
+    const c = html[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(html.slice(objStart, i + 1)); }
+        catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+// Декодируем HTML-сущности и убираем теги — описания Kwork содержат &laquo; и т.п.
+function cleanText(raw: string): string {
+  return String(raw || '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&laquo;/g, '«').replace(/&raquo;/g, '»')
+    .replace(/&nbsp;/g, ' ').replace(/&mdash;/g, '—').replace(/&ndash;/g, '–')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)))
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Преобразуем «want» (заказ Kwork) в нашу модель проекта.
+function mapWantToProject(want: any, categoryUrl: string): KworkProject {
+  const id = String(want.id);
+  const title = cleanText(want.name);
+  const description = cleanText(want.description);
+
+  // Бюджет. priceLimit — нижняя планка, possiblePriceLimit — верхняя (если выше).
+  let budget = 'Цена договорная';
+  const price = parseFloat(want.priceLimit);
+  if (!isNaN(price) && price > 0) {
+    const low = Math.round(price).toLocaleString('ru-RU');
+    const higher = parseFloat(want.possiblePriceLimit);
+    if (!isNaN(higher) && higher > price) {
+      budget = `${low} – ${Math.round(higher).toLocaleString('ru-RU')} ₽`;
+    } else {
+      budget = `до ${low} ₽`;
+    }
+  }
+
+  const offersCount = parseInt(want.kwork_count, 10) || 0;
+  const createdAtText = want.timeLeft
+    ? `осталось ${want.timeLeft}`
+    : (want.wantDates?.dateCreate || 'Недавно');
+
+  return {
+    id,
+    categoryUrl,
+    title,
+    budget,
+    description,
+    offersCount,
+    createdAtText,
+    link: `https://kwork.ru/projects/${id}/view`,
+    scrapedAt: new Date().toISOString()
+  };
+}
+
+// Резервный парсер через cheerio — на случай, если Kwork изменит формат stateData.
+function legacyCheerioParse(html: string, url: string): KworkProject[] {
   const $ = cheerio.load(html);
   const projects: KworkProject[] = [];
 
-  // Match the core items. Inside Kwork freelance page, items are labeled '.wants-card' or '.want-card'
-  const cardElements = $('.wants-card, .want-card, .want-block, .want-inner, [class*="want-card"]');
-  
-  if (cardElements.length === 0) {
-    // Adaptive fallback. Traverse any links pointing to /projects/
-    $('a[href*="/projects/"]').each((i, el) => {
-      const link = $(el).attr('href') || '';
-      
-      let parent = $(el).parent();
-      for (let depth = 0; depth < 5; depth++) {
-        if (parent.text().length > 150 && parent.find('a[href*="/projects/"]').length < 3) {
-          break;
-        }
-        parent = parent.parent();
-      }
-      
-      const title = $(el).text().trim();
-      if (!title || projects.some(p => p.link.includes(link))) return;
+  $('a[href*="/projects/"]').each((i, el) => {
+    const link = $(el).attr('href') || '';
+    const title = $(el).text().trim();
+    if (!title || projects.some(p => p.link.includes(link))) return;
 
-      const fullLink = link.startsWith('http') ? link : `https://kwork.ru${link}`;
-      const description = parent.text().replace(title, '').replace(/\s+/g, ' ').trim().slice(0, 300) + '...';
-      const budgetMatch = parent.text().match(/(?:бюджет|цена|до|желаемый|допустимый)\s*[:\-]?\s*[\d\s\xa0]+(?:₽|руб|рублей|\$|USD)/i);
-      const budget = budgetMatch ? budgetMatch[0].trim() : 'Цена не указана';
-      
-      const projId = link.split('/').pop()?.split('-')?.[0] || String(Math.abs(hashString(fullLink)));
+    const fullLink = link.startsWith('http') ? link : `https://kwork.ru${link}`;
+    let parent = $(el).parent();
+    for (let depth = 0; depth < 5; depth++) {
+      if (parent.text().length > 150) break;
+      parent = parent.parent();
+    }
+    const description = parent.text().replace(title, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    const budgetMatch = parent.text().match(/[\d\s\xa0]+(?:₽|руб|рублей)/i);
+    const projId = link.split('/').filter(Boolean).pop()?.split('-')[0] || String(Math.abs(hashString(fullLink)));
 
-      projects.push({
-        id: projId,
-        categoryUrl: url,
-        title,
-        budget,
-        description,
-        offersCount: 0,
-        createdAtText: 'Недавно',
-        link: fullLink,
-        scrapedAt: new Date().toISOString()
-      });
+    projects.push({
+      id: projId,
+      categoryUrl: url,
+      title,
+      budget: budgetMatch ? budgetMatch[0].trim() : 'Цена не указана',
+      description,
+      offersCount: 0,
+      createdAtText: 'Недавно',
+      link: fullLink,
+      scrapedAt: new Date().toISOString()
     });
-  } else {
-    cardElements.each((index, element) => {
-      const card = $(element);
-      
-      const titleAnchor = card.find('a[href*="/projects/"]').first();
-      const title = titleAnchor.text().trim();
-      const relativeLink = titleAnchor.attr('href') || '';
-      if (!title || !relativeLink) return;
-
-      const fullLink = relativeLink.startsWith('http') ? relativeLink : `https://kwork.ru${relativeLink}`;
-
-      // Extract description
-      let description = card.find('.wants-card__description, .wants-card__text, [class*="description"], [class*="text"]').text().trim();
-      if (!description) {
-        description = card.find('p, span').text().trim().substring(0, 300);
-      }
-      if (!description) {
-        description = card.text().replace(title, '').substring(0, 300).trim();
-      }
-      // Formatting description: clean multiple spaces
-      description = description.replace(/\s+/g, ' ');
-
-      // Extract budget
-      let budget = card.find('.wants-card__price, .price, [class*="price"], [class*="budget"]').text().trim();
-      if (!budget) {
-        const matches = card.text().match(/(?:Цена до|Желаемый бюджет|Допустимый бюджет|Бюджет|Цена)\s*[:\-]?\s*[\d\s\xa0]+(?:₽|руб|рублей|\$|USD)/i);
-        budget = matches ? matches[0].trim() : '';
-      }
-      if (!budget) {
-        const anyPrice = card.text().match(/[\d\s\xa0]+(?:₽|руб|USD|\$)/i);
-        budget = anyPrice ? anyPrice[0].trim() : 'Цена не указана';
-      }
-
-      // Extract offers count
-      const rawOffersText = card.find('.wants-card__offers, [class*="offers"], [class*="offer"]').text().trim();
-      let offersCount = 0;
-      const offersMatch = (rawOffersText || card.text()).match(/(\d+)\s*(?:предложен|отклик|заяв)/i);
-      if (offersMatch) {
-        offersCount = parseInt(offersMatch[1], 10);
-      }
-
-      // Extract creation time
-      let createdAtText = card.find('.wants-card__header-time, [class*="time"], [class*="date"]').text().trim();
-      if (!createdAtText) {
-        const timeMatch = card.text().match(/(?:создано|опубликовано)\s*[:\-]?\s*(\d+\s*(?:минут|час|день|сек|мин)\s*назад)/i);
-        createdAtText = timeMatch ? timeMatch[1] : 'Только что';
-      }
-
-      const projId = relativeLink.split('/').pop()?.split('-')?.[0] || String(Math.abs(hashString(fullLink)));
-
-      projects.push({
-        id: projId,
-        categoryUrl: url,
-        title,
-        budget,
-        description,
-        offersCount,
-        createdAtText,
-        link: fullLink,
-        scrapedAt: new Date().toISOString()
-      });
-    });
-  }
+  });
 
   return projects;
+}
+
+// Признак блокировки/капчи: Kwork отдаёт 403/429/503 либо страницу-челлендж
+// без полноценного stateData. Бросаем особую ошибку для адаптивного бэкоффа.
+class KworkBlockedError extends Error {
+  constructor(msg: string) { super(msg); this.name = 'KworkBlockedError'; }
+}
+
+// Главный парсер страницы категории Kwork.
+async function parseKworkPage(url: string): Promise<KworkProject[]> {
+  await warmUpSession();
+
+  const response = await kworkFetch(url);
+
+  if (response.status === 403 || response.status === 429 || response.status === 503) {
+    sessionWarmed = false; // принудительный повторный «прогрев» в следующий раз
+    throw new KworkBlockedError(`Kwork вернул ${response.status} — вероятно, временное ограничение/капча.`);
+  }
+  if (!response.ok) {
+    throw new Error(`Kwork ответил статусом ${response.status}`);
+  }
+
+  const html = await response.text();
+  const state = extractStateData(html);
+
+  // Основной путь: данные заказов лежат в window.stateData.wants
+  if (state && Array.isArray(state.wants)) {
+    return state.wants
+      .filter((w: any) => w && w.id && (w.status === 'active' || w.isWantActive))
+      .map((w: any) => mapWantToProject(w, url));
+  }
+
+  // stateData не найден — возможно челлендж-страница. Пробуем резервный парсер.
+  const fallback = legacyCheerioParse(html, url);
+  if (fallback.length === 0) {
+    sessionWarmed = false;
+    throw new KworkBlockedError('Не удалось извлечь данные заказов (нет stateData) — возможна капча/блокировка.');
+  }
+  return fallback;
 }
 
 // Global counters & statuses
@@ -373,6 +466,7 @@ let isCurrentlyParsing = false;
 let lastPulseTimestamp = new Date().toISOString();
 let errorCount = 0;
 let uptimeTimer = 0;
+let backoffLevel = 0; // растёт при блокировках/капче, замедляет опрос
 setInterval(() => { uptimeTimer++; }, 1000);
 
 // Core Background Loop Scraper Execution
@@ -394,6 +488,7 @@ async function runScrakingCycle() {
       try {
         // Fetch and parse the projects
         const fetched = await parseKworkPage(category.url);
+        backoffLevel = Math.max(0, backoffLevel - 1); // успех — снижаем бэкофф
         addLog('info', `Спарсено ${fetched.length} проектов из категории "${category.name}".`);
 
         // Check which projects are brand new
@@ -433,13 +528,18 @@ async function runScrakingCycle() {
 
         saveDB(db);
 
-        // Random delay (1000ms - 5000ms) inside loop to mimic human reading and avoid Kwork blocks
-        const randomWait = 1000 + Math.random() * 4000;
+        // Random delay (2000ms - 6000ms) inside loop to mimic human reading and avoid Kwork blocks
+        const randomWait = 2000 + Math.random() * 4000;
         await new Promise(resolve => setTimeout(resolve, randomWait));
 
       } catch (catError: any) {
         errorCount++;
-        addLog('error', `Не удалось спарсить данные с URL "${category.url}": ${catError.message}`);
+        if (catError instanceof KworkBlockedError) {
+          backoffLevel = Math.min(6, backoffLevel + 1);
+          addLog('warning', `Похоже на ограничение Kwork по "${category.name}": ${catError.message} Замедляюсь (уровень бэкоффа ${backoffLevel}).`);
+        } else {
+          addLog('error', `Не удалось спарсить данные с URL "${category.url}": ${catError.message}`);
+        }
       }
     }
   } catch (error: any) {
@@ -465,7 +565,9 @@ function scheduleNextScrape() {
     // Calculate randomized interval with tiny jitter +/- 10 seconds to bypass static automation detectors
     const baseMs = db.settings.intervalMinutes * 60 * 1000;
     const jitter = (Math.random() * 20000) - 10000; // -10s to +10s
-    const delay = Math.max(15000, baseMs + jitter); // Min 15 seconds
+    // При блокировках/капче добавляем по минуте за уровень бэкоффа (до +6 мин)
+    const backoffMs = backoffLevel * 60 * 1000;
+    const delay = Math.max(15000, baseMs + jitter + backoffMs); // Min 15 seconds
     scraperTimeout = setTimeout(loop, delay);
   };
 
@@ -499,6 +601,80 @@ setInterval(() => {
 
 // Express Server API Routing configuration
 app.use(express.json());
+
+// ----------------------------------------------------------------------------
+// АВТОРИЗАЦИЯ ПАНЕЛИ (пароль задаётся как SHA-256 хэш в .env)
+// ----------------------------------------------------------------------------
+// В .env хранится DASHBOARD_PASSWORD_HASH — это sha256(пароль) в hex, а не сам
+// пароль. Если переменная пуста, панель открыта (обратная совместимость).
+// Сгенерировать хэш:
+//   node -e "console.log(require('crypto').createHash('sha256').update('ВАШ_ПАРОЛЬ').digest('hex'))"
+const PASSWORD_HASH = (process.env.DASHBOARD_PASSWORD_HASH || '').trim().toLowerCase();
+const activeSessions = new Set<string>();
+
+function sha256Hex(input: string): string {
+  return crypto.createHash('sha256').update(input, 'utf8').digest('hex');
+}
+
+function parseCookies(req: express.Request): Record<string, string> {
+  const out: Record<string, string> = {};
+  const header = req.headers.cookie;
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0) out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return out;
+}
+
+function isAuthenticated(req: express.Request): boolean {
+  if (!PASSWORD_HASH) return true; // пароль не настроен — доступ открыт
+  const token = parseCookies(req).kwork_session;
+  return !!token && activeSessions.has(token);
+}
+
+// Публичные эндпоинты, не требующие входа (логин, проверка, VK-вебхук).
+const PUBLIC_API_PATHS = new Set(['/login', '/logout', '/auth/check', '/vk-callback']);
+
+app.use('/api', (req, res, next) => {
+  if (PUBLIC_API_PATHS.has(req.path)) return next();
+  if (isAuthenticated(req)) return next();
+  return res.status(401).json({ error: 'Требуется авторизация' });
+});
+
+// Сообщает фронтенду, нужен ли вход и авторизован ли пользователь.
+app.get('/api/auth/check', (req, res) => {
+  res.json({ authRequired: !!PASSWORD_HASH, authenticated: isAuthenticated(req) });
+});
+
+// Вход по паролю → выдаём httpOnly cookie-сессию.
+app.post('/api/login', (req, res) => {
+  if (!PASSWORD_HASH) return res.json({ success: true });
+
+  const given = sha256Hex(String((req.body && req.body.password) || ''));
+  const a = Buffer.from(given);
+  const b = Buffer.from(PASSWORD_HASH);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+
+  if (!ok) {
+    addLog('warning', 'Неудачная попытка входа в панель управления (неверный пароль).');
+    return res.status(401).json({ error: 'Неверный пароль' });
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  activeSessions.add(token);
+  res.setHeader('Set-Cookie', `kwork_session=${token}; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax`);
+  addLog('success', 'Выполнен успешный вход в панель управления.');
+  res.json({ success: true });
+});
+
+// Выход — удаляем сессию.
+app.post('/api/logout', (req, res) => {
+  const token = parseCookies(req).kwork_session;
+  if (token) activeSessions.delete(token);
+  res.setHeader('Set-Cookie', 'kwork_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax');
+  res.json({ success: true });
+});
 
 // API Status
 app.get('/api/status', (req, res) => {
