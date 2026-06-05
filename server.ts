@@ -110,11 +110,25 @@ function hashString(str: string): number {
   return hash;
 }
 
+// Уровень логирования (.env LOG_LEVEL):
+//   error — только ошибки (по умолчанию; не засоряет журнал и не пишет лог на диск)
+//   warn  — ошибки + предупреждения (блокировки/капча, ночной режим)
+//   all   — всё (для отладки)
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'error').trim().toLowerCase();
+const LOG_RANK: Record<string, number> = { error: 0, warning: 1, success: 2, info: 2 };
+const LOG_THRESHOLDS: Record<string, number> = { error: 0, warn: 1, warning: 1, all: 2 };
+const logThreshold = LOG_THRESHOLDS[LOG_LEVEL] ?? 0;
+
 // Add system log
 function addLog(type: LogEntry['type'], message: string) {
+  // Фильтр по уровню: всё ниже порога не пишем ни в журнал, ни в базу —
+  // это убирает спам в journalctl и лишние записи db.json на диск.
+  const rank = LOG_RANK[type] ?? 2;
+  if (rank > logThreshold) return;
+
   const timestamp = new Date().toISOString();
   console.log(`[${type.toUpperCase()}] ${timestamp}: ${message}`);
-  
+
   const newLog: LogEntry = {
     id: Math.random().toString(36).substring(2, 9),
     timestamp,
@@ -130,7 +144,7 @@ function addLog(type: LogEntry['type'], message: string) {
   saveDB(db);
 }
 
-addLog('info', 'Парсер запущен и готов к работе!');
+console.log(`[INFO] Парсер запущен. Уровень логирования: ${LOG_LEVEL} (меняется в .env → LOG_LEVEL).`);
 
 // VK Integration: Send Message API Client
 async function sendVkMessage(peerId: string, messageText: string, keyboardObj?: any): Promise<boolean> {
