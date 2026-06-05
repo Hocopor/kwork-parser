@@ -428,11 +428,19 @@ class KworkBlockedError extends Error {
   constructor(msg: string) { super(msg); this.name = 'KworkBlockedError'; }
 }
 
-// Главный парсер страницы категории Kwork.
-async function parseKworkPage(url: string): Promise<KworkProject[]> {
-  await warmUpSession();
+// Максимум страниц на категорию — предохранитель от бесконечного цикла.
+const MAX_PAGES_PER_CATEGORY = 60;
 
-  const response = await kworkFetch(url);
+// Добавляет/перезаписывает параметр page в URL категории.
+function buildPageUrl(categoryUrl: string, page: number): string {
+  const u = new URL(categoryUrl);
+  u.searchParams.set('page', String(page));
+  return u.toString();
+}
+
+// Парсит ОДНУ страницу категории. Возвращает заказы и общее число страниц.
+async function fetchKworkPage(pageUrl: string, categoryUrl: string): Promise<{ projects: KworkProject[]; lastPage: number }> {
+  const response = await kworkFetch(pageUrl);
 
   if (response.status === 403 || response.status === 429 || response.status === 503) {
     sessionWarmed = false; // принудительный повторный «прогрев» в следующий раз
@@ -447,18 +455,49 @@ async function parseKworkPage(url: string): Promise<KworkProject[]> {
 
   // Основной путь: данные заказов лежат в window.stateData.wants
   if (state && Array.isArray(state.wants)) {
-    return state.wants
+    const projects = state.wants
       .filter((w: any) => w && w.id && (w.status === 'active' || w.isWantActive))
-      .map((w: any) => mapWantToProject(w, url));
+      .map((w: any) => mapWantToProject(w, categoryUrl));
+    const lastPage =
+      state?.wantsListData?.pagination?.last_page ??
+      state?.pagination?.last_page ?? 1;
+    return { projects, lastPage: Number(lastPage) || 1 };
   }
 
   // stateData не найден — возможно челлендж-страница. Пробуем резервный парсер.
-  const fallback = legacyCheerioParse(html, url);
+  const fallback = legacyCheerioParse(html, categoryUrl);
   if (fallback.length === 0) {
     sessionWarmed = false;
     throw new KworkBlockedError('Не удалось извлечь данные заказов (нет stateData) — возможна капча/блокировка.');
   }
-  return fallback;
+  return { projects: fallback, lastPage: 1 };
+}
+
+// Главный парсер категории: проходит ВСЕ страницы пагинации и собирает
+// полный текущий список заказов категории.
+async function parseKworkCategory(categoryUrl: string): Promise<KworkProject[]> {
+  await warmUpSession();
+
+  const all: KworkProject[] = [];
+  const seenIds = new Set<string>();
+
+  const first = await fetchKworkPage(buildPageUrl(categoryUrl, 1), categoryUrl);
+  for (const p of first.projects) {
+    if (!seenIds.has(p.id)) { seenIds.add(p.id); all.push(p); }
+  }
+
+  const lastPage = Math.min(first.lastPage, MAX_PAGES_PER_CATEGORY);
+  for (let page = 2; page <= lastPage; page++) {
+    // Вежливая задержка между страницами, чтобы не словить ограничение.
+    await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
+    const res = await fetchKworkPage(buildPageUrl(categoryUrl, page), categoryUrl);
+    if (res.projects.length === 0) break; // страниц больше нет
+    for (const p of res.projects) {
+      if (!seenIds.has(p.id)) { seenIds.add(p.id); all.push(p); }
+    }
+  }
+
+  return all;
 }
 
 // Global counters & statuses
@@ -486,49 +525,66 @@ async function runScrakingCycle() {
       addLog('info', `Парсинг категории: "${category.name}" (${category.url})...`);
       
       try {
-        // Fetch and parse the projects
-        const fetched = await parseKworkPage(category.url);
+        // Проходим ВСЕ страницы категории — это полный текущий список заказов.
+        const fetched = await parseKworkCategory(category.url);
         backoffLevel = Math.max(0, backoffLevel - 1); // успех — снижаем бэкофф
-        addLog('info', `Спарсено ${fetched.length} проектов из категории "${category.name}".`);
+        const fetchedIds = new Set(fetched.map(p => p.id));
 
-        // Check which projects are brand new
-        const newProjects: KworkProject[] = [];
+        // Что у нас уже сохранено по этой категории.
+        const existingForCat = db.scrapedProjects.filter(p => p.categoryUrl === category.url);
 
-        for (const proj of fetched) {
-          const isKnown = db.scrapedProjects.some(existing => existing.id === proj.id);
-          if (!isKnown) {
-            newProjects.push(proj);
-            db.scrapedProjects.push(proj);
+        addLog('info', `Спарсено ${fetched.length} проектов (все страницы) из категории "${category.name}".`);
+
+        if (existingForCat.length === 0) {
+          // ПЕРВИЧНЫЙ СБОР: база по категории пуста — наполняем её МОЛЧА,
+          // без рассылки в ВК, чтобы не спамить старыми заказами.
+          db.scrapedProjects.push(...fetched);
+          saveDB(db);
+          addLog('success', `Первичный сбор "${category.name}": в базу занесено ${fetched.length} заказов (без оповещений).`);
+        } else {
+          // Новые заказы — те, которых ещё нет в базе по этой категории.
+          const knownIds = new Set(existingForCat.map(p => p.id));
+          const newProjects = fetched.filter(p => !knownIds.has(p.id));
+
+          // Заказы, которых больше нет на сайте — удаляем из базы.
+          const removedIds = existingForCat.filter(p => !fetchedIds.has(p.id)).map(p => p.id);
+          if (removedIds.length > 0) {
+            const removedSet = new Set(removedIds);
+            db.scrapedProjects = db.scrapedProjects.filter(
+              p => !(p.categoryUrl === category.url && removedSet.has(p.id))
+            );
+            addLog('info', `Категория "${category.name}": снято с сайта и удалено из базы ${removedIds.length} заказов.`);
           }
-        }
 
-        addLog('success', `Категория "${category.name}": ${newProjects.length} новых проектов обнаружено.`);
+          // Добавляем новые в базу.
+          db.scrapedProjects.push(...newProjects);
+          saveDB(db);
 
-        // Notify in VK for each new project detected
-        for (const newProj of newProjects) {
-          const message = `🔔 НОВЫЙ ПРОЕКТ НА KWORK!\n\n` +
-            `📌 ${newProj.title}\n` +
-            `💰 Бюджет: ${newProj.budget}\n` +
-            `🕒 Время публикации: ${newProj.createdAtText}\n` +
-            `💬 Количество предложений: ${newProj.offersCount}\n\n` +
-            `📄 Описание:\n${newProj.description.substring(0, 350)}${newProj.description.length > 350 ? '...' : ''}\n\n` +
-            `🔗 Ссылка на проект: ${newProj.link}`;
+          addLog('success', `Категория "${category.name}": новых ${newProjects.length}, удалено ${removedIds.length}.`);
 
-          // Notify all admins configured
-          const targetIds = db.settings.vkGroupChatId ? [db.settings.vkGroupChatId] : db.settings.adminIds;
-          for (const uid of targetIds) {
-            if (uid) {
-              const success = await sendVkMessage(uid, message);
-              if (success) {
-                addLog('success', `Уведомление о проекте "${newProj.title}" отослано пользователю VK: ${uid}`);
+          // Рассылаем в ВК каждый новый заказ.
+          for (const newProj of newProjects) {
+            const message = `🔔 НОВЫЙ ПРОЕКТ НА KWORK!\n\n` +
+              `📌 ${newProj.title}\n` +
+              `💰 Бюджет: ${newProj.budget}\n` +
+              `🕒 Время публикации: ${newProj.createdAtText}\n` +
+              `💬 Количество предложений: ${newProj.offersCount}\n\n` +
+              `📄 Описание:\n${newProj.description.substring(0, 350)}${newProj.description.length > 350 ? '...' : ''}\n\n` +
+              `🔗 Ссылка на проект: ${newProj.link}`;
+
+            const targetIds = db.settings.vkGroupChatId ? [db.settings.vkGroupChatId] : db.settings.adminIds;
+            for (const uid of targetIds) {
+              if (uid) {
+                const success = await sendVkMessage(uid, message);
+                if (success) {
+                  addLog('success', `Уведомление о проекте "${newProj.title}" отослано пользователю VK: ${uid}`);
+                }
               }
             }
           }
         }
 
-        saveDB(db);
-
-        // Random delay (2000ms - 6000ms) inside loop to mimic human reading and avoid Kwork blocks
+        // Random delay (2000ms - 6000ms) between categories to mimic human reading
         const randomWait = 2000 + Math.random() * 4000;
         await new Promise(resolve => setTimeout(resolve, randomWait));
 
@@ -578,25 +634,9 @@ function scheduleNextScrape() {
 // Launch parser initially
 scheduleNextScrape();
 
-// Automatic Weekly database cleanup (automatically stop, purge scrapedProjects, restart)
-// This strictly satisfies user requirement to clear ancient database products every 7 days
-setInterval(() => {
-  addLog('warning', 'ВНИМАНИЕ: Затиск еженедельной автоматической очистки неактуальных проектов...');
-  
-  const tempParsingActive = db.settings.isParsingActive;
-  db.settings.isParsingActive = false;
-  
-  // Wipe database of scraped projects to save size and load fresh
-  db.scrapedProjects = [];
-  addLog('success', 'База старых проектов была очищена по еженедельному графику для оптимизации хранения.');
-  
-  db.settings.isParsingActive = tempParsingActive;
-  saveDB(db);
-  
-  if (db.settings.isParsingActive) {
-    addLog('info', 'Парсинг автоматически возобновлен с чистой базой.');
-  }
-}, 7 * 24 * 60 * 60 * 1000); // 7 days interval in milliseconds
+// Прежний еженедельный автосброс базы удалён: теперь актуальность поддерживается
+// каждым циклом — заказы, пропавшие с сайта, удаляются автоматически, а новые
+// добавляются и рассылаются в ВК (см. runScrakingCycle).
 
 
 // Express Server API Routing configuration
@@ -719,14 +759,14 @@ app.post('/api/categories', async (req, res) => {
   addLog('success', `Добавлен новый URL для парсинга: "${cleanName}" (${url})`);
   saveDB(db);
 
-  // Trigger quick parse instantly to pre-populate database for this, so that old orders aren't treated as "new"
+  // Полный первичный сбор ВСЕХ страниц, чтобы существующие заказы не ушли в ВК как «новые».
   setTimeout(async () => {
     try {
-      addLog('info', `Первоначальный фоновый сбор проектов для новой ссылки: "${cleanName}" во избежание спама...`);
-      const fetched = await parseKworkPage(newCat.url);
+      addLog('info', `Первичный сбор всех страниц для новой ссылки: "${cleanName}" во избежание спама...`);
+      const fetched = await parseKworkCategory(newCat.url);
       let count = 0;
       for (const p of fetched) {
-        if (!db.scrapedProjects.some(x => x.id === p.id)) {
+        if (!db.scrapedProjects.some(x => x.id === p.id && x.categoryUrl === newCat.url)) {
           db.scrapedProjects.push(p);
           count++;
         }
@@ -768,7 +808,7 @@ app.delete('/api/categories/:id', (req, res) => {
 app.get('/api/projects', (req, res) => {
   // Return sorted projects by date (newest first)
   const sorted = [...db.scrapedProjects].sort((a, b) => new Date(b.scrapedAt).getTime() - new Date(a.scrapedAt).getTime());
-  res.json(sorted.slice(0, 150)); // cap at 150 projects
+  res.json(sorted.slice(0, 1000)); // cap at 1000 projects for the UI feed
 });
 
 // GET runtime engine logs
@@ -962,12 +1002,12 @@ app.post('/api/vk-callback', async (req, res) => {
         
         await sendVkMessage(peerId, `✅ Настройка принята! Добавлена новая ссылка для мониторинга: ${text}\nВыполняю фоновый первичный сбор заказов...`, getVkKeyboard());
         
-        // Background scrap
+        // Полный фоновый первичный сбор всех страниц.
         setTimeout(async () => {
           try {
-            const fetched = await parseKworkPage(newCat.url);
+            const fetched = await parseKworkCategory(newCat.url);
             for (const p of fetched) {
-              if (!db.scrapedProjects.some(x => x.id === p.id)) {
+              if (!db.scrapedProjects.some(x => x.id === p.id && x.categoryUrl === newCat.url)) {
                 db.scrapedProjects.push(p);
               }
             }
