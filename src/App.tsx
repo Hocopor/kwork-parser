@@ -22,7 +22,8 @@ import {
   ChevronRight,
   Info,
   Lock,
-  LogOut
+  LogOut,
+  Moon
 } from 'lucide-react';
 import { KworkProject, KworkCategory, LogEntry, ParserStatus } from './types';
 
@@ -165,7 +166,10 @@ function Dashboard({ authRequired, onLogout }: { authRequired: boolean; onLogout
     vkGroupChatId: '',
     adminIds: [] as string[],
     isParsingActive: false,
-    intervalMinutes: 2
+    intervalMinutes: 2,
+    nightModeEnabled: false,
+    nightStartHour: 0,
+    nightEndHour: 8
   });
 
   // Data feeds
@@ -360,7 +364,10 @@ function Dashboard({ authRequired, onLogout }: { authRequired: boolean; onLogout
         vkConfirmCode: settings.vkConfirmCode,
         vkGroupChatId: settings.vkGroupChatId,
         adminIds: adminIdsInput.split(',').map(x => x.trim()).filter(Boolean),
-        intervalMinutes: settings.intervalMinutes
+        intervalMinutes: settings.intervalMinutes,
+        nightModeEnabled: settings.nightModeEnabled,
+        nightStartHour: settings.nightStartHour,
+        nightEndHour: settings.nightEndHour
       };
 
       const response = await fetch('/api/control/settings', {
@@ -790,6 +797,69 @@ function Dashboard({ authRequired, onLogout }: { authRequired: boolean; onLogout
                       Оптимально 2-3 минуты. Рандомизированный джиттер (+/- 10 сек) применяется автоматически.
                     </p>
                   </div>
+                </div>
+
+                {/* NIGHT MODE */}
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Moon className="w-4 h-4 text-indigo-500" />
+                      <div>
+                        <div className="text-sm font-bold text-slate-800">Ночной режим</div>
+                        <div className="text-[11px] text-slate-400">
+                          На ночь по Москве (UTC+3) парсер засыпает и не дёргает Kwork.
+                        </div>
+                      </div>
+                    </div>
+                    {/* Toggle */}
+                    <button
+                      type="button"
+                      onClick={() => setSettings(prev => ({ ...prev, nightModeEnabled: !prev.nightModeEnabled }))}
+                      className={`relative w-12 h-6 rounded-full transition-colors flex-shrink-0 cursor-pointer ${
+                        settings.nightModeEnabled ? 'bg-indigo-600' : 'bg-slate-300'
+                      }`}
+                      title="Включить/выключить ночной режим"
+                    >
+                      <span
+                        className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${
+                          settings.nightModeEnabled ? 'translate-x-6' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {settings.nightModeEnabled && (
+                    <div className="grid grid-cols-2 gap-4 mt-4 pt-4 border-t border-slate-200">
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-wider text-slate-500 block mb-1.5">
+                          Засыпать в (час МСК)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          max="23"
+                          className="w-full text-sm bg-white border border-slate-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all font-mono"
+                          value={settings.nightStartHour}
+                          onChange={(e) => setSettings(prev => ({ ...prev, nightStartHour: parseInt(e.target.value, 10) }))}
+                        />
+                        <p className="text-[10px] text-slate-400 mt-1">Например, 0 = полночь.</p>
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-wider text-slate-500 block mb-1.5">
+                          Просыпаться в (час МСК)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          max="23"
+                          className="w-full text-sm bg-white border border-slate-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all font-mono"
+                          value={settings.nightEndHour}
+                          onChange={(e) => setSettings(prev => ({ ...prev, nightEndHour: parseInt(e.target.value, 10) }))}
+                        />
+                        <p className="text-[10px] text-slate-400 mt-1">Например, 8 = 08:00 утра.</p>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-100">

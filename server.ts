@@ -34,6 +34,9 @@ interface LocalDatabase {
     adminIds: string[];
     isParsingActive: boolean;
     intervalMinutes: number;
+    nightModeEnabled: boolean;
+    nightStartHour: number; // час по Москве (UTC+3), когда парсер засыпает
+    nightEndHour: number;   // час по Москве, когда просыпается
   };
 }
 
@@ -55,7 +58,10 @@ const defaultDb: LocalDatabase = {
     vkGroupChatId: process.env.VK_GROUP_CHAT_ID || '',
     adminIds: process.env.VK_ADMIN_IDS ? process.env.VK_ADMIN_IDS.split(',').map(x => x.trim()) : [],
     isParsingActive: true,
-    intervalMinutes: 2 // check every 2 minutes
+    intervalMinutes: 2, // check every 2 minutes
+    nightModeEnabled: false,
+    nightStartHour: 0,  // 00:00 МСК
+    nightEndHour: 8     // 08:00 МСК
   }
 };
 
@@ -231,24 +237,37 @@ function getVkKeyboard() {
 }
 
 // ----------------------------------------------------------------------------
-// KWORK HTTP SESSION (стабильный отпечаток браузера + хранилище cookie)
+// KWORK HTTP SESSION + РОТАЦИЯ ПРОКСИ
 // ----------------------------------------------------------------------------
-// Ротация User-Agent на каждый запрос — это само по себе признак бота (один и
-// тот же cookie-сеанс с разными UA выглядит подозрительно). Поэтому фиксируем
-// ОДИН реалистичный отпечаток Chrome на весь процесс и сохраняем cookie между
-// запросами — так трафик неотличим от обычного вернувшегося пользователя.
-const SESSION_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const cookieJar = new Map<string, string>();
-let sessionWarmed = false;
+// IP дата-центров/VPS Kwork (Qrator) блокирует капчей/403. Чтобы этого избежать,
+// запросы распределяются по пулу прокси (round-robin). Каждый прокси — отдельная
+// «полоса» (lane) со своим cookie-сеансом и своим отпечатком браузера, как будто
+// это разные реальные пользователи. При 403/429/503 полоса уходит в «остывание»,
+// а запрос мгновенно повторяется через другой прокси — поэтому блок не всплывает.
+//
+// Прокси задаются в .env через KWORK_PROXY (можно несколько через запятую):
+//   KWORK_PROXY=http://user:pass@host1:port,http://user:pass@host2:port
+// Если пусто — одна «прямая» полоса с IP сервера.
 
-// ----------------------------------------------------------------------------
-// ПРОКСИ ДЛЯ ЗАПРОСОВ К KWORK
-// ----------------------------------------------------------------------------
-// IP дата-центров/VPS Kwork (Qrator) часто блокирует капчей/403. Чтобы ходить
-// через жилой/мобильный IP, задайте в .env:
-//   KWORK_PROXY=http://user:pass@host:port   (поддерживается http/https-прокси)
-// Если переменная пуста — запросы идут напрямую с IP сервера.
-const KWORK_PROXY = (process.env.KWORK_PROXY || '').trim();
+// Набор реалистичных отпечатков Chrome/Firefox — по одному на полосу.
+const FINGERPRINTS = [
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', chUa: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"', platform: '"Windows"', mobile: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36', chUa: '"Chromium";v="123", "Google Chrome";v="123", "Not-A.Brand";v="99"', platform: '"Windows"', mobile: '?0' },
+  { ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', chUa: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"', platform: '"macOS"', mobile: '?0' },
+  { ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36', chUa: '"Chromium";v="123", "Google Chrome";v="123", "Not-A.Brand";v="99"', platform: '"Linux"', mobile: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0', chUa: '', platform: '"Windows"', mobile: '?0' }
+];
+
+interface ProxyLane {
+  label: string;                    // host:port или 'direct' — для логов
+  dispatcher?: ProxyAgent;          // undefined = прямое соединение
+  cookies: Map<string, string>;     // свой cookie-сеанс
+  fp: typeof FINGERPRINTS[number];  // свой отпечаток браузера
+  warmed: boolean;                  // был ли «прогрев» главной
+  cooldownUntil: number;            // до какого времени (epoch ms) полоса «остывает»
+}
+
+const PROXY_COOLDOWN_MS = 5 * 60 * 1000; // блокировка полосы на 5 минут после 403
 
 function buildProxyDispatcher(proxyUrl: string): ProxyAgent {
   const u = new URL(proxyUrl);
@@ -260,51 +279,77 @@ function buildProxyDispatcher(proxyUrl: string): ProxyAgent {
   return new ProxyAgent(opts);
 }
 
-let proxyDispatcher: ProxyAgent | undefined;
-if (KWORK_PROXY) {
-  try {
-    proxyDispatcher = buildProxyDispatcher(KWORK_PROXY);
-    console.log(`[INFO] Запросы к Kwork идут через прокси: ${new URL(KWORK_PROXY).host}`);
-  } catch (e: any) {
-    console.error(`[ERROR] Некорректный KWORK_PROXY (${e.message}). Иду напрямую без прокси.`);
-  }
-}
+// Собираем пул полос из KWORK_PROXY.
+const lanes: ProxyLane[] = [];
+{
+  const proxyList = (process.env.KWORK_PROXY || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
 
-function buildCookieHeader(): string {
-  return [...cookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-function storeCookies(res: Response) {
-  // Node 18+ предоставляет getSetCookie(); подстраховываемся одиночным заголовком.
-  let rawCookies: string[] = [];
-  const anyHeaders = res.headers as any;
-  if (typeof anyHeaders.getSetCookie === 'function') {
-    rawCookies = anyHeaders.getSetCookie();
+  if (proxyList.length === 0) {
+    lanes.push({ label: 'direct', dispatcher: undefined, cookies: new Map(), fp: FINGERPRINTS[0], warmed: false, cooldownUntil: 0 });
+    console.log('[INFO] KWORK_PROXY не задан — запросы идут напрямую с IP сервера.');
   } else {
-    const single = res.headers.get('set-cookie');
-    if (single) rawCookies = [single];
-  }
-  for (const c of rawCookies) {
-    const pair = c.split(';')[0];
-    const eq = pair.indexOf('=');
-    if (eq > 0) {
-      cookieJar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    proxyList.forEach((p, idx) => {
+      try {
+        const dispatcher = buildProxyDispatcher(p);
+        lanes.push({
+          label: new URL(p).host,
+          dispatcher,
+          cookies: new Map(),
+          fp: FINGERPRINTS[idx % FINGERPRINTS.length],
+          warmed: false,
+          cooldownUntil: 0
+        });
+      } catch (e: any) {
+        console.error(`[ERROR] Пропускаю некорректный прокси "${p}": ${e.message}`);
+      }
+    });
+    if (lanes.length === 0) {
+      lanes.push({ label: 'direct', dispatcher: undefined, cookies: new Map(), fp: FINGERPRINTS[0], warmed: false, cooldownUntil: 0 });
+      console.log('[INFO] Все прокси некорректны — иду напрямую.');
+    } else {
+      console.log(`[INFO] Пул прокси для Kwork: ${lanes.length} шт. (ротация round-robin).`);
     }
   }
 }
 
-// Единая точка HTTP-запросов к Kwork с человекоподобными заголовками.
-async function kworkFetch(url: string, referer = 'https://kwork.ru/projects'): Promise<Response> {
+let laneCursor = 0;
+
+// Выбираем следующую доступную полосу (round-robin, пропуская «остывающие»).
+function pickLane(): ProxyLane {
+  const now = Date.now();
+  const n = lanes.length;
+  for (let i = 0; i < n; i++) {
+    const lane = lanes[(laneCursor + i) % n];
+    if (lane.cooldownUntil <= now) {
+      laneCursor = (laneCursor + i + 1) % n;
+      return lane;
+    }
+  }
+  // Все полосы «остывают» — берём ту, что освободится раньше всех.
+  return lanes.reduce((best, l) => (l.cooldownUntil < best.cooldownUntil ? l : best), lanes[0]);
+}
+
+function storeCookiesInto(jar: Map<string, string>, res: Response) {
+  let rawCookies: string[] = [];
+  const anyHeaders = res.headers as any;
+  if (typeof anyHeaders.getSetCookie === 'function') rawCookies = anyHeaders.getSetCookie();
+  else { const single = res.headers.get('set-cookie'); if (single) rawCookies = [single]; }
+  for (const c of rawCookies) {
+    const pair = c.split(';')[0];
+    const eq = pair.indexOf('=');
+    if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+}
+
+// Низкоуровневый запрос через конкретную полосу (свой прокси/cookie/отпечаток).
+async function rawFetch(lane: ProxyLane, url: string, referer: string): Promise<Response> {
   const headers: Record<string, string> = {
-    'User-Agent': SESSION_UA,
+    'User-Agent': lane.fp.ua,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
-    'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'same-origin',
@@ -312,31 +357,71 @@ async function kworkFetch(url: string, referer = 'https://kwork.ru/projects'): P
     'Upgrade-Insecure-Requests': '1',
     'Referer': referer
   };
-  const cookie = buildCookieHeader();
+  if (lane.fp.chUa) {
+    headers['Sec-Ch-Ua'] = lane.fp.chUa;
+    headers['Sec-Ch-Ua-Mobile'] = lane.fp.mobile;
+    headers['Sec-Ch-Ua-Platform'] = lane.fp.platform;
+  }
+  const cookie = [...lane.cookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
   if (cookie) headers['Cookie'] = cookie;
 
-  // dispatcher — undici-расширение fetch; через него подключаем прокси.
   const fetchOptions: any = { headers, redirect: 'follow' };
-  if (proxyDispatcher) fetchOptions.dispatcher = proxyDispatcher;
+  if (lane.dispatcher) fetchOptions.dispatcher = lane.dispatcher;
 
   const response = await fetch(url, fetchOptions);
-  storeCookies(response);
+  storeCookiesInto(lane.cookies, response);
   return response;
 }
 
-// «Прогрев» сессии: один заход на главную, чтобы получить cookie как настоящий
-// браузер, прежде чем дёргать страницы категорий.
-async function warmUpSession() {
-  if (sessionWarmed) return;
-  try {
-    const res = await kworkFetch('https://kwork.ru/', 'https://www.google.com/');
-    if (res.ok) {
-      sessionWarmed = true;
-      await new Promise(r => setTimeout(r, 800 + Math.random() * 1200));
+// Главная точка запросов: выбирает полосу, при блоке мгновенно повторяет через
+// другую. Блок «всплывает» наверх только если ВСЕ испробованные полосы заблокированы.
+async function kworkFetch(url: string, referer = 'https://kwork.ru/projects'): Promise<Response> {
+  const maxAttempts = Math.max(1, Math.min(lanes.length, 5));
+  let lastBlocked: Response | null = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const lane = pickLane();
+
+    // «Прогрев» полосы: один заход на главную для получения cookie.
+    if (!lane.warmed) {
+      try {
+        const w = await rawFetch(lane, 'https://kwork.ru/', 'https://www.google.com/');
+        if (w.ok) {
+          lane.warmed = true;
+          await new Promise(r => setTimeout(r, 500 + Math.random() * 900));
+        } else if (w.status === 403 || w.status === 429 || w.status === 503) {
+          lane.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS;
+          lastBlocked = w;
+          continue;
+        }
+      } catch {
+        lane.cooldownUntil = Date.now() + 60 * 1000;
+        continue;
+      }
     }
-  } catch {
-    // тихо игнорируем — основной запрос всё равно попробует
+
+    let res: Response;
+    try {
+      res = await rawFetch(lane, url, referer);
+    } catch {
+      // сетевая ошибка полосы — короткое остывание и пробуем другую
+      lane.cooldownUntil = Date.now() + 60 * 1000;
+      lane.warmed = false;
+      continue;
+    }
+
+    if (res.status === 403 || res.status === 429 || res.status === 503) {
+      lane.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS;
+      lane.warmed = false;
+      lastBlocked = res;
+      continue; // мгновенно пробуем следующий прокси
+    }
+
+    return res;
   }
+
+  if (lastBlocked) return lastBlocked; // вызывающий код увидит 403 и бросит KworkBlockedError
+  throw new Error('Все прокси недоступны (сетевые ошибки).');
 }
 
 // Извлекаем JSON из `window.stateData = {...}` балансировкой скобок.
@@ -477,8 +562,8 @@ async function fetchKworkPage(pageUrl: string, categoryUrl: string): Promise<{ p
   const response = await kworkFetch(pageUrl);
 
   if (response.status === 403 || response.status === 429 || response.status === 503) {
-    sessionWarmed = false; // принудительный повторный «прогрев» в следующий раз
-    throw new KworkBlockedError(`Kwork вернул ${response.status} — вероятно, временное ограничение/капча.`);
+    // Все доступные полосы (прокси) вернули блок — kworkFetch их уже «остудил».
+    throw new KworkBlockedError(`Kwork вернул ${response.status} на всех прокси — временное ограничение/капча.`);
   }
   if (!response.ok) {
     throw new Error(`Kwork ответил статусом ${response.status}`);
@@ -501,7 +586,6 @@ async function fetchKworkPage(pageUrl: string, categoryUrl: string): Promise<{ p
   // stateData не найден — возможно челлендж-страница. Пробуем резервный парсер.
   const fallback = legacyCheerioParse(html, categoryUrl);
   if (fallback.length === 0) {
-    sessionWarmed = false;
     throw new KworkBlockedError('Не удалось извлечь данные заказов (нет stateData) — возможна капча/блокировка.');
   }
   return { projects: fallback, lastPage: 1 };
@@ -510,8 +594,6 @@ async function fetchKworkPage(pageUrl: string, categoryUrl: string): Promise<{ p
 // Главный парсер категории: проходит ВСЕ страницы пагинации и собирает
 // полный текущий список заказов категории.
 async function parseKworkCategory(categoryUrl: string): Promise<KworkProject[]> {
-  await warmUpSession();
-
   const all: KworkProject[] = [];
   const seenIds = new Set<string>();
 
@@ -542,10 +624,36 @@ let uptimeTimer = 0;
 let backoffLevel = 0; // растёт при блокировках/капче, замедляет опрос
 setInterval(() => { uptimeTimer++; }, 1000);
 
+// Ночной режим: проверяем, попадает ли текущее московское время (UTC+3) в окно сна.
+let nightModeLogged = false;
+function isNightTimeNow(): boolean {
+  if (!db.settings.nightModeEnabled) return false;
+  const moscowHour = (new Date().getUTCHours() + 3) % 24;
+  const start = db.settings.nightStartHour;
+  const end = db.settings.nightEndHour;
+  if (start === end) return false; // пустое окно
+  // Окно может переходить через полночь (например, 23 → 7).
+  return start < end ? (moscowHour >= start && moscowHour < end)
+                     : (moscowHour >= start || moscowHour < end);
+}
+
 // Core Background Loop Scraper Execution
 async function runScrakingCycle() {
   if (isCurrentlyParsing) return;
   if (!db.settings.isParsingActive) return;
+
+  // Ночной режим — пропускаем цикл, не дёргая Kwork.
+  if (isNightTimeNow()) {
+    if (!nightModeLogged) {
+      addLog('info', `🌙 Ночной режим активен (${String(db.settings.nightStartHour).padStart(2, '0')}:00–${String(db.settings.nightEndHour).padStart(2, '0')}:00 МСК). Парсинг приостановлен до утра.`);
+      nightModeLogged = true;
+    }
+    return;
+  }
+  if (nightModeLogged) {
+    addLog('success', '☀️ Ночной режим окончен — возобновляю парсинг.');
+    nightModeLogged = false;
+  }
 
   isCurrentlyParsing = true;
   lastPulseTimestamp = new Date().toISOString();
@@ -626,9 +734,10 @@ async function runScrakingCycle() {
         errorCount++;
         if (catError instanceof KworkBlockedError) {
           backoffLevel = Math.min(6, backoffLevel + 1);
-          const proxyHint = proxyDispatcher
-            ? ''
-            : ' Подсказка: похоже на блок IP сервера — задайте KWORK_PROXY в .env (жилой/мобильный прокси).';
+          const usingProxies = lanes.some(l => l.dispatcher);
+          const proxyHint = usingProxies
+            ? ' Все прокси временно заблокированы — возможно, нужны residential/мобильные IP.'
+            : ' Подсказка: похоже на блок IP сервера — задайте KWORK_PROXY в .env (несколько прокси через запятую).';
           addLog('warning', `Похоже на ограничение Kwork по "${category.name}": ${catError.message} Замедляюсь (уровень бэкоффа ${backoffLevel}).${proxyHint}`);
         } else {
           addLog('error', `Не удалось спарсить данные с URL "${category.url}": ${catError.message}`);
@@ -881,13 +990,24 @@ app.post('/api/control/clear-db', (req, res) => {
 
 // POST Change Settings (VK token, admin ids, intervals)
 app.post('/api/control/settings', (req, res) => {
-  const { vkToken, vkConfirmCode, vkGroupChatId, adminIds, intervalMinutes } = req.body;
-  
+  const { vkToken, vkConfirmCode, vkGroupChatId, adminIds, intervalMinutes,
+          nightModeEnabled, nightStartHour, nightEndHour } = req.body;
+
   if (vkToken !== undefined) db.settings.vkToken = vkToken;
   if (vkConfirmCode !== undefined) db.settings.vkConfirmCode = vkConfirmCode;
   if (vkGroupChatId !== undefined) db.settings.vkGroupChatId = vkGroupChatId;
   if (intervalMinutes !== undefined) db.settings.intervalMinutes = Math.max(1, parseInt(intervalMinutes, 10));
-  
+
+  if (nightModeEnabled !== undefined) db.settings.nightModeEnabled = !!nightModeEnabled;
+  if (nightStartHour !== undefined) {
+    const h = parseInt(nightStartHour, 10);
+    if (!isNaN(h) && h >= 0 && h <= 23) db.settings.nightStartHour = h;
+  }
+  if (nightEndHour !== undefined) {
+    const h = parseInt(nightEndHour, 10);
+    if (!isNaN(h) && h >= 0 && h <= 23) db.settings.nightEndHour = h;
+  }
+
   if (adminIds !== undefined) {
     db.settings.adminIds = Array.isArray(adminIds) 
       ? adminIds.map((x: any) => String(x).trim()) 
