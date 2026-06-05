@@ -10,7 +10,7 @@ import { KworkProject, KworkCategory, LogEntry, ParserStatus } from './src/types
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || '3001', 10);
 
 // Setup directories and local database persistence
 const DATA_DIR = path.join(process.cwd(), 'data');
