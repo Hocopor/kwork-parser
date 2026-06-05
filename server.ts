@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { ProxyAgent } from 'undici';
 import { createServer as createViteServer } from 'vite';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
@@ -240,6 +241,35 @@ const SESSION_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const cookieJar = new Map<string, string>();
 let sessionWarmed = false;
 
+// ----------------------------------------------------------------------------
+// ПРОКСИ ДЛЯ ЗАПРОСОВ К KWORK
+// ----------------------------------------------------------------------------
+// IP дата-центров/VPS Kwork (Qrator) часто блокирует капчей/403. Чтобы ходить
+// через жилой/мобильный IP, задайте в .env:
+//   KWORK_PROXY=http://user:pass@host:port   (поддерживается http/https-прокси)
+// Если переменная пуста — запросы идут напрямую с IP сервера.
+const KWORK_PROXY = (process.env.KWORK_PROXY || '').trim();
+
+function buildProxyDispatcher(proxyUrl: string): ProxyAgent {
+  const u = new URL(proxyUrl);
+  const opts: any = { uri: `${u.protocol}//${u.host}` };
+  if (u.username || u.password) {
+    const creds = Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64');
+    opts.token = `Basic ${creds}`;
+  }
+  return new ProxyAgent(opts);
+}
+
+let proxyDispatcher: ProxyAgent | undefined;
+if (KWORK_PROXY) {
+  try {
+    proxyDispatcher = buildProxyDispatcher(KWORK_PROXY);
+    console.log(`[INFO] Запросы к Kwork идут через прокси: ${new URL(KWORK_PROXY).host}`);
+  } catch (e: any) {
+    console.error(`[ERROR] Некорректный KWORK_PROXY (${e.message}). Иду напрямую без прокси.`);
+  }
+}
+
 function buildCookieHeader(): string {
   return [...cookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 }
@@ -285,7 +315,11 @@ async function kworkFetch(url: string, referer = 'https://kwork.ru/projects'): P
   const cookie = buildCookieHeader();
   if (cookie) headers['Cookie'] = cookie;
 
-  const response = await fetch(url, { headers, redirect: 'follow' });
+  // dispatcher — undici-расширение fetch; через него подключаем прокси.
+  const fetchOptions: any = { headers, redirect: 'follow' };
+  if (proxyDispatcher) fetchOptions.dispatcher = proxyDispatcher;
+
+  const response = await fetch(url, fetchOptions);
   storeCookies(response);
   return response;
 }
@@ -592,7 +626,10 @@ async function runScrakingCycle() {
         errorCount++;
         if (catError instanceof KworkBlockedError) {
           backoffLevel = Math.min(6, backoffLevel + 1);
-          addLog('warning', `Похоже на ограничение Kwork по "${category.name}": ${catError.message} Замедляюсь (уровень бэкоффа ${backoffLevel}).`);
+          const proxyHint = proxyDispatcher
+            ? ''
+            : ' Подсказка: похоже на блок IP сервера — задайте KWORK_PROXY в .env (жилой/мобильный прокси).';
+          addLog('warning', `Похоже на ограничение Kwork по "${category.name}": ${catError.message} Замедляюсь (уровень бэкоффа ${backoffLevel}).${proxyHint}`);
         } else {
           addLog('error', `Не удалось спарсить данные с URL "${category.url}": ${catError.message}`);
         }
