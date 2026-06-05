@@ -674,37 +674,33 @@ async function runScrakingCycle() {
 
         // Что у нас уже сохранено по этой категории.
         const existingForCat = db.scrapedProjects.filter(p => p.categoryUrl === category.url);
+        const knownIds = new Set(existingForCat.map(p => p.id));
+        const isFirstHarvest = existingForCat.length === 0;
 
         addLog('info', `Спарсено ${fetched.length} проектов (все страницы) из категории "${category.name}".`);
 
-        if (existingForCat.length === 0) {
-          // ПЕРВИЧНЫЙ СБОР: база по категории пуста — наполняем её МОЛЧА,
-          // без рассылки в ВК, чтобы не спамить старыми заказами.
-          db.scrapedProjects.push(...fetched);
-          saveDB(db);
-          addLog('success', `Первичный сбор "${category.name}": в базу занесено ${fetched.length} заказов (без оповещений).`);
-        } else {
-          // Новые заказы — те, которых ещё нет в базе по этой категории.
-          const knownIds = new Set(existingForCat.map(p => p.id));
-          const newProjects = fetched.filter(p => !knownIds.has(p.id));
+        // Новые заказы — которых ещё нет в базе. При пустой базе новыми считаются ВСЕ.
+        const newProjects = fetched.filter(p => !knownIds.has(p.id));
 
-          // Заказы, которых больше нет на сайте — удаляем из базы.
-          const removedIds = existingForCat.filter(p => !fetchedIds.has(p.id)).map(p => p.id);
-          if (removedIds.length > 0) {
-            const removedSet = new Set(removedIds);
-            db.scrapedProjects = db.scrapedProjects.filter(
-              p => !(p.categoryUrl === category.url && removedSet.has(p.id))
-            );
-            addLog('info', `Категория "${category.name}": снято с сайта и удалено из базы ${removedIds.length} заказов.`);
-          }
+        // Заказы, которых больше нет на сайте — удаляем из базы.
+        const removedIds = existingForCat.filter(p => !fetchedIds.has(p.id)).map(p => p.id);
+        if (removedIds.length > 0) {
+          const removedSet = new Set(removedIds);
+          db.scrapedProjects = db.scrapedProjects.filter(
+            p => !(p.categoryUrl === category.url && removedSet.has(p.id))
+          );
+          addLog('info', `Категория "${category.name}": снято с сайта и удалено из базы ${removedIds.length} заказов.`);
+        }
 
-          // Добавляем новые в базу.
-          db.scrapedProjects.push(...newProjects);
-          saveDB(db);
+        // Добавляем новые в базу.
+        db.scrapedProjects.push(...newProjects);
+        saveDB(db);
 
-          addLog('success', `Категория "${category.name}": новых ${newProjects.length}, удалено ${removedIds.length}.`);
+        addLog('success', `Категория "${category.name}": новых ${newProjects.length}${isFirstHarvest ? ' (первичный сбор — отправляю все)' : ''}, удалено ${removedIds.length}.`);
 
-          // Рассылаем в ВК каждый новый заказ.
+        // Рассылаем в ВК каждый новый заказ (в т.ч. весь первичный сбор).
+        if (newProjects.length > 0) {
+          const targetIds = db.settings.vkGroupChatId ? [db.settings.vkGroupChatId] : db.settings.adminIds;
           for (const newProj of newProjects) {
             const message = `🔔 НОВЫЙ ПРОЕКТ НА KWORK!\n\n` +
               `📌 ${newProj.title}\n` +
@@ -714,7 +710,6 @@ async function runScrakingCycle() {
               `📄 Описание:\n${newProj.description.substring(0, 350)}${newProj.description.length > 350 ? '...' : ''}\n\n` +
               `🔗 Ссылка на проект: ${newProj.link}`;
 
-            const targetIds = db.settings.vkGroupChatId ? [db.settings.vkGroupChatId] : db.settings.adminIds;
             for (const uid of targetIds) {
               if (uid) {
                 const success = await sendVkMessage(uid, message);
@@ -723,6 +718,8 @@ async function runScrakingCycle() {
                 }
               }
             }
+            // Троттлинг: пауза между сообщениями, чтобы ВК не забанил за флуд.
+            await new Promise(r => setTimeout(r, 400));
           }
         }
 
@@ -902,28 +899,11 @@ app.post('/api/categories', async (req, res) => {
   };
 
   db.categories.push(newCat);
-  addLog('success', `Добавлен новый URL для парсинга: "${cleanName}" (${url})`);
+  addLog('success', `Добавлен новый URL для парсинга: "${cleanName}" (${url}). Ближайший цикл соберёт и пришлёт в ВК все его заказы.`);
   saveDB(db);
 
-  // Полный первичный сбор ВСЕХ страниц, чтобы существующие заказы не ушли в ВК как «новые».
-  setTimeout(async () => {
-    try {
-      addLog('info', `Первичный сбор всех страниц для новой ссылки: "${cleanName}" во избежание спама...`);
-      const fetched = await parseKworkCategory(newCat.url);
-      let count = 0;
-      for (const p of fetched) {
-        if (!db.scrapedProjects.some(x => x.id === p.id && x.categoryUrl === newCat.url)) {
-          db.scrapedProjects.push(p);
-          count++;
-        }
-      }
-      addLog('success', `Собрано ${count} существующих проектов. Они сохранены в базе как "ранее известные".`);
-      saveDB(db);
-    } catch (e: any) {
-      addLog('error', `Не удалось выполнить первоначальный спарсинг при добавлении ссылки: ${e.message}`);
-    }
-  }, 100);
-
+  // Без «тихого» пресбора: ближайший цикл увидит пустую базу по этой категории
+  // и пришлёт в ВК все её заказы (по запросу пользователя «отправлять все»).
   res.json(newCat);
 });
 
@@ -1156,24 +1136,9 @@ app.post('/api/vk-callback', async (req, res) => {
         db.categories.push(newCat);
         addLog('success', `Добавлена ссылка из ВК: ${text}`);
         saveDB(db);
-        
-        await sendVkMessage(peerId, `✅ Настройка принята! Добавлена новая ссылка для мониторинга: ${text}\nВыполняю фоновый первичный сбор заказов...`, getVkKeyboard());
-        
-        // Полный фоновый первичный сбор всех страниц.
-        setTimeout(async () => {
-          try {
-            const fetched = await parseKworkCategory(newCat.url);
-            for (const p of fetched) {
-              if (!db.scrapedProjects.some(x => x.id === p.id && x.categoryUrl === newCat.url)) {
-                db.scrapedProjects.push(p);
-              }
-            }
-            saveDB(db);
-            addLog('success', `Фоновый первичный сбор успешно завершен для добавленной из ВК категории.`);
-          } catch (e: any) {
-            addLog('error', `Не удалось сделать фоновый запуск: ${e.message}`);
-          }
-        }, 100);
+
+        // Без «тихого» пресбора — ближайший цикл соберёт и пришлёт все заказы.
+        await sendVkMessage(peerId, `✅ Настройка принята! Добавлена новая ссылка для мониторинга: ${text}\nБлижайший цикл соберёт и пришлёт сюда все её заказы.`, getVkKeyboard());
       }
 
     } else if (lowerText.startsWith('/del_') || lowerText.startsWith('удалить ')) {
